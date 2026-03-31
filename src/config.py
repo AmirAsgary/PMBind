@@ -1,47 +1,75 @@
 """
 Configuration for the Cluster-Based Bayesian Label Denoising pipeline.
+
 All paths, hyperparameters, and constants in one place.
+Paths are set dynamically from CLI arguments — nothing is hardcoded.
 """
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
 @dataclass
 class PipelineConfig:
-    # ── paths ──
-    data_dir: Path = Path("./data")
-    output_dir: Path = Path("./outputs")
-    parquet_path: Path = None  # set in __post_init__
-    fasta_path: Path = None
-    # ── clustering ──
-    cluster_identity: int = 80  # 60 or 80 (maps to mmseqs60/mmseqs80)
-    cluster_tsv: Path = None    # set in __post_init__
+    # ── paths (set by CLI — no defaults) ──
+    observations_path: Path = None   # parquet / csv / tsv with peptide observations
+    cluster_dir: Path = None         # anchor_cluster.py output directory
+    output_dir: Path = None          # set in __post_init__ → cluster_dir/stage1
+
     # ── HLA filtering ──
-    hla_prefix: str = "HLA"  # keep only alleles starting with this
+    hla_prefix: str = "HLA"
+
+    # ── observation columns ──
+    #   peptide_col : column containing peptide sequences (join key to clusters)
+    #   allele_col  : column containing HLA allele names
+    #   label_col   : column containing binding labels (0/1)
+    peptide_col: str = "long_mer"
+    allele_col: str = "allele"
+    label_col: str = "assigned_label"
+
     # ── Level 1: binary noise model ──
-    alpha_default: float = 0.10   # default false negative rate
-    beta_default: float = 0.02    # default false positive rate
-    noise_min_cluster_size: int = 5       # min observations to estimate noise
-    noise_purity_threshold: float = 0.90  # fraction for "near-unanimous" clusters
+    alpha_default: float = 0.10
+    beta_default: float = 0.02
+    noise_min_cluster_size: int = 5
+    noise_purity_threshold: float = 0.90
+
     # ── Level 1: binarisation ──
-    tau_multiplier: float = 2.0  # tau_h = tau_multiplier * pi_h
+    tau_multiplier: float = 2.0
+
     # ── Level 2: similarity ──
-    fdr_threshold: float = 0.05    # Benjamini-Hochberg FDR
-    min_shared_clusters: int = 10  # minimum shared clusters for a valid pair
-    n_jobs: int = 12               # parallel workers
+    fdr_threshold: float = 0.05
+    min_shared_clusters: int = 10
+    n_jobs: int = 12
+
     # ── Level 3: propagation ──
-    kappa_0: float = 10.0  # confidence hyperparameter
-    propagate_only_rare: bool = True  # only propagate to under-represented HLAs
-    rare_hla_max_obs: int = 5000      # HLAs with fewer obs are "rare"
-    # ── memory ──
-    parquet_columns: list = field(default_factory=lambda: [
-        "long_mer", "allele", "assigned_label"
-    ])
+    kappa_0: float = 10.0
+    propagate_only_rare: bool = True
+    rare_hla_max_obs: int = 5000
+
     def __post_init__(self):
-        self.parquet_path = self.data_dir / "PMDb_2025_11_18_class1.parquet"
-        self.fasta_path = self.data_dir / "peptides.fasta"
-        ident = self.cluster_identity
+        # resolve to Path objects
+        if self.observations_path is not None:
+            self.observations_path = Path(self.observations_path)
+        if self.cluster_dir is not None:
+            self.cluster_dir = Path(self.cluster_dir)
+
+        # output lives inside the cluster directory
+        if self.cluster_dir is not None:
+            self.output_dir = self.cluster_dir / "stage1"
+        elif self.output_dir is None:
+            self.output_dir = Path("./outputs/stage1")
+
+        self.output_dir = Path(self.output_dir)
+
+        # derived paths inside cluster_dir
         self.cluster_tsv = (
-            self.data_dir / f"mmseqs{ident}" / f"cluster{ident}_cluster.tsv"
+            self.cluster_dir / "clusters.tsv" if self.cluster_dir else None
         )
-        # ensure output dirs exist
+
+        # ensure output subdirs exist
         for sub in ["level1", "level2", "level3"]:
             (self.output_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    # convenience: columns to load if the input is parquet
+    @property
+    def load_columns(self):
+        return [self.peptide_col, self.allele_col, self.label_col]
