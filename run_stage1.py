@@ -43,8 +43,10 @@ Outputs (written to <cluster-dir>/stage1/):
 """
 
 import argparse
+import sys
 import time
 import gc
+from datetime import datetime
 from pathlib import Path
 
 from src.config import PipelineConfig
@@ -58,7 +60,7 @@ from src.level1 import run_level1
 from src.level2 import run_level2
 from src.level3 import run_level3
 from src.diagnostics import run_diagnostics
-from src.em_wrapper import run_em
+from src.gibbs import run_gibbs
 
 
 def parse_args():
@@ -113,15 +115,18 @@ def parse_args():
     p.add_argument("--skip-level3", action="store_true",
                     help="Skip label propagation (Level 3)")
 
-    # ── EM iterative refinement ──
-    p.add_argument("--em-iter", type=int, default=0,
-                    help="Number of EM iterations (0 = single pass, no EM). "
-                         "Recommended: 3-5 for refinement.")
-    p.add_argument("--em-tol", type=float, default=1e-3,
-                    help="EM convergence tolerance (default: 1e-3)")
-    p.add_argument("--em-recompute-S", type=int, default=3,
-                    help="Recompute similarity matrix every K EM iterations "
-                         "(default: 3). Set to 1 for full recomputation.")
+    # ── Gibbs sampling iterative refinement ──
+    p.add_argument("--gibbs-iter", type=int, default=0,
+                    help="Number of Gibbs iterations (0 = single pass). "
+                         "Recommended: 5-10.")
+    p.add_argument("--gibbs-tol", type=float, default=1e-3,
+                    help="Gibbs convergence tolerance (default: 1e-3)")
+    p.add_argument("--gibbs-recompute-S", type=int, default=3,
+                    help="Recompute similarity every K Gibbs iterations "
+                         "(default: 3)")
+    p.add_argument("--gibbs-deterministic", action="store_true",
+                    help="Use deterministic theta (mean) instead of "
+                         "stochastic Bernoulli sampling")
 
     return p.parse_args()
 
@@ -166,10 +171,30 @@ def main():
         fdr_threshold=args.fdr,
         min_shared_clusters=args.min_shared,
         rare_hla_max_obs=args.rare_max_obs,
-        em_max_iter=args.em_iter,
-        em_tol=args.em_tol,
-        em_recompute_S_every=args.em_recompute_S,
+        gibbs_max_iter=args.gibbs_iter,
+        gibbs_tol=args.gibbs_tol,
+        gibbs_recompute_S_every=args.gibbs_recompute_S,
+        gibbs_sample_theta=not args.gibbs_deterministic,
     )
+
+    # ── set up logging: mirror all stdout to a log file ──
+    log_path = cfg.output_dir / f"stage1_{datetime.now():%Y%m%d_%H%M%S}.log"
+    _original_stdout = sys.stdout
+    _log_file = open(log_path, "w")
+
+    class _Tee:
+        """Write to both console and log file simultaneously."""
+        def __init__(self, *streams):
+            self.streams = streams
+        def write(self, data):
+            for s in self.streams:
+                s.write(data)
+                s.flush()
+        def flush(self):
+            for s in self.streams:
+                s.flush()
+
+    sys.stdout = _Tee(_original_stdout, _log_file)
 
     # ── print configuration ──
     print("Pipeline Configuration:")
@@ -185,11 +210,15 @@ def main():
     print(f"  FDR threshold:     {cfg.fdr_threshold}")
     print(f"  min_shared:        {cfg.min_shared_clusters}")
     print(f"  Parallel workers:  {cfg.n_jobs}")
-    print(f"  EM iterations:     {cfg.em_max_iter} "
-          f"({'single pass' if cfg.em_max_iter == 0 else 'iterative'})")
-    if cfg.em_max_iter > 0:
-        print(f"  EM tolerance:      {cfg.em_tol}")
-        print(f"  EM recompute S:    every {cfg.em_recompute_S_every} iterations")
+    print(f"  Gibbs iterations:  {cfg.gibbs_max_iter} "
+          f"({'single pass' if cfg.gibbs_max_iter == 0 else 'iterative'})")
+    if cfg.gibbs_max_iter > 0:
+        print(f"  Gibbs tolerance:   {cfg.gibbs_tol}")
+        print(f"  Gibbs recompute S: every {cfg.gibbs_recompute_S_every} iterations")
+        print(f"  Gibbs sampling:    "
+              f"{'stochastic' if cfg.gibbs_sample_theta else 'deterministic'}")
+    print(f"  Conservative OR:   {cfg.use_conservative_or}")
+    print(f"  Coverage penalty:  tau={cfg.coverage_penalty_tau}")
 
     t_start = time.time()
 
@@ -201,10 +230,10 @@ def main():
     print("=" * 60)
 
     df = load_observations(cfg)
-    pep_to_cluster = load_cluster_mapping(cfg)
+    pep_to_cluster, cluster_sizes = load_cluster_mapping(cfg)
     agg, hla_names = build_aggregated_counts(df, pep_to_cluster, cfg)
 
-    del df, pep_to_cluster  # free ~4-6 GB
+    del df, pep_to_cluster  # free ~4-6 GB (keep cluster_sizes — small dict)
     gc.collect()
 
     n_hla = len(hla_names)
@@ -223,16 +252,16 @@ def main():
     gc.collect()
 
     # ══════════════════════════════════════════════════════════════
-    # BRANCH: single-pass vs EM iterative refinement
+    # BRANCH: single-pass vs Gibbs iterative refinement
     # ══════════════════════════════════════════════════════════════
     prop_df = None
 
-    if cfg.em_max_iter > 0:
-        # ── EM iterative refinement ──
-        # This loop re-runs Levels 1-3 until gamma converges.
-        # Level 2 is recomputed every em_recompute_S_every iterations.
-        agg, S, pairwise_df, prop_df, p_h = run_em(
-            agg, n_hla, p_h, hla_names, cfg,
+    if cfg.gibbs_max_iter > 0:
+        # ── Gibbs iterative refinement ──
+        # This loop samples theta, re-estimates noise (Bayesian),
+        # recomputes gamma, and feeds propagated labels back.
+        agg, S, pairwise_df, prop_df, p_h = run_gibbs(
+            agg, n_hla, p_h, hla_names, cluster_sizes, cfg,
             skip_level3=args.skip_level3,
         )
         gc.collect()
@@ -240,13 +269,14 @@ def main():
     else:
         # ── single pass (original pipeline) ──
 
-        # Level 2: HLA Similarity
+        # Level 2: Allele Similarity
         S, pairwise_df = run_level2(agg, n_hla, hla_names, cfg)
         gc.collect()
 
-        # Level 3: Label Propagation
+        # Level 3: Label Propagation (with coverage penalty)
         if not args.skip_level3:
-            prop_df = run_level3(agg, S, n_hla, p_h, hla_names, cfg)
+            prop_df = run_level3(
+                agg, S, n_hla, p_h, hla_names, cluster_sizes, cfg)
             gc.collect()
 
     # ══════════════════════════════════════════════════════════════
@@ -263,9 +293,14 @@ def main():
     n_sig = (pairwise_df["significant"].sum()
              if not pairwise_df.empty else 0)
     print(f"  Significant allele pairs:   {n_sig:,}")
-    if cfg.em_max_iter > 0:
-        print(f"  EM iterations:              {cfg.em_max_iter}")
+    if cfg.gibbs_max_iter > 0:
+        print(f"  Gibbs iterations:           {cfg.gibbs_max_iter}")
     print(f"\nOutputs in: {cfg.output_dir}/")
+    print(f"Log saved to: {log_path}")
+
+    # ── restore stdout and close log file ──
+    sys.stdout = _original_stdout
+    _log_file.close()
 
 
 if __name__ == "__main__":

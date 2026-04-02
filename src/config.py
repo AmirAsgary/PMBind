@@ -45,11 +45,13 @@ class PipelineConfig:
     p_h_ceil: float = 0.95        # maximum allowed p_h after shrinkage
 
     # ── Level 1: binary noise model ───────────────────────────────────
-    # Noise parameters estimated from high-confidence clusters.
-    # alpha_h = false negative rate (missed binders)
-    # beta_h  = false positive rate (contaminant binders)
-    alpha_default: float = 0.10   # default when too few high-confidence clusters
-    beta_default: float = 0.02    # default when too few high-confidence clusters
+    # Noise parameters estimated from high-confidence clusters, with
+    # Beta-prior regularisation (Solution 2: Bayesian noise treatment).
+    # Prior encodes global expectation: E[alpha] ≈ a/(a+b).
+    alpha_prior_a: float = 2.0    # Beta(2, 18) → E[alpha] ≈ 0.10
+    alpha_prior_b: float = 18.0
+    beta_prior_a: float = 1.0     # Beta(1, 49) → E[beta] ≈ 0.02
+    beta_prior_b: float = 49.0
     noise_min_cluster_size: int = 5       # min observations to estimate noise
     noise_purity_threshold: float = 0.90  # fraction for "near-unanimous" clusters
 
@@ -63,16 +65,25 @@ class PipelineConfig:
     fdr_threshold: float = 0.05    # Benjamini-Hochberg FDR
     min_shared_clusters: int = 10  # minimum shared clusters for a valid pair
     n_jobs: int = 12               # parallel workers for Fisher tests
+    use_conservative_or: bool = True   # Solution 3: use lower-bound OR with
+                                       # Haldane-Anscombe correction instead of
+                                       # point estimate, to prevent rare-allele
+                                       # inflation of propagation weights.
 
     # ── Level 3: label propagation ────────────────────────────────────
     kappa_0: float = 10.0          # confidence hyperparameter for lambda_ch
     propagate_only_rare: bool = True   # only propagate to under-represented alleles
     rare_hla_max_obs: int = 5000       # alleles with fewer obs are "rare"
+    coverage_penalty_tau: float = 0.5  # Solution 1: power-law exponent for coverage
+                                       # penalty f(rho_c) = rho_c^tau.  Penalises
+                                       # extrapolation from sparsely labeled clusters.
 
-    # ── EM iteration ──────────────────────────────────────────────────
-    em_max_iter: int = 5           # maximum EM iterations (0 = single-pass)
-    em_tol: float = 1e-3           # convergence tolerance (max |delta gamma|)
-    em_recompute_S_every: int = 3  # recompute similarity matrix every K iterations
+    # ── Gibbs sampling ──────────────────────────────────────────────
+    gibbs_max_iter: int = 10       # maximum Gibbs iterations (0 = single-pass)
+    gibbs_tol: float = 1e-3        # convergence tolerance (max |delta gamma|)
+    gibbs_recompute_S_every: int = 3  # recompute similarity every K iterations
+    gibbs_sample_theta: bool = True   # True = stochastic Gibbs; False = deterministic
+                                      # (use posterior mean instead of Bernoulli draw)
 
     def __post_init__(self):
         """Resolve paths and create output directories."""

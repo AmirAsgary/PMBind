@@ -116,27 +116,22 @@ def load_observations(cfg: PipelineConfig) -> pd.DataFrame:
 # Cluster mapping
 # ============================================================================
 
-def load_cluster_mapping(cfg: PipelineConfig) -> dict:
+def load_cluster_mapping(cfg: PipelineConfig) -> tuple:
     """
-    Load anchor_cluster.py output → dict mapping peptide_seq → cluster_id (int).
-
-    Reads clusters.tsv with columns:
-      cluster_id | representative_anchor | peptide_header | sequence | anchor
-
-    The cluster_id strings ("cluster_0", "cluster_1", ...) are parsed into
-    integer ids for memory-efficient downstream processing.
+    Load anchor_cluster.py output → dict mapping peptide_seq → cluster_id (int),
+    plus a dict of cluster sizes |c| for the coverage penalty (Solution 1).
 
     Returns:
-        dict {sequence_string: cluster_id_int}
+        (pep_to_cluster, cluster_sizes)
+        pep_to_cluster:  dict {sequence_string: cluster_id_int}
+        cluster_sizes:   dict {cluster_id_int: number_of_peptides_in_cluster}
     """
     cluster_tsv = cfg.cluster_tsv
     print(f"[data] Loading cluster mapping: {cluster_tsv}")
     t0 = time.time()
 
-    # only read the two columns we need
     df = pd.read_csv(cluster_tsv, sep="\t", usecols=["cluster_id", "sequence"])
 
-    # parse "cluster_42" → 42
     df["cluster_id_num"] = (
         df["cluster_id"]
         .str.split("_", n=1)
@@ -148,6 +143,10 @@ def load_cluster_mapping(cfg: PipelineConfig) -> dict:
     # if a sequence appears in multiple rows (same cluster), first wins
     pep_to_cluster = dict(zip(df["sequence"], df["cluster_id_num"]))
 
+    # build cluster sizes: cluster_id → total peptide count in that cluster
+    size_series = df.groupby("cluster_id_num").size()
+    cluster_sizes = dict(zip(size_series.index, size_series.values))
+
     n_clusters = df["cluster_id_num"].nunique()
     print(f"  Clusters: {n_clusters:,}  "
           f"Peptides mapped: {len(pep_to_cluster):,}  "
@@ -155,7 +154,7 @@ def load_cluster_mapping(cfg: PipelineConfig) -> dict:
 
     del df
     gc.collect()
-    return pep_to_cluster
+    return pep_to_cluster, cluster_sizes
 
 
 # ============================================================================

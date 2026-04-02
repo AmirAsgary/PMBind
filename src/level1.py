@@ -33,32 +33,25 @@ def estimate_noise_params(
 ) -> tuple:
     """
     Estimate per-allele false negative (alpha_h) and false positive (beta_h)
-    rates from high-confidence clusters.
+    rates using Beta-prior regularisation (Solution 2).
 
-    Strategy:
-      alpha_h: fraction of non-binder labels in near-unanimous binder clusters
-               (clusters where >90% of labels are binders and n >= 5).
-               Represents missed detections due to low abundance or poor ionisation.
+    Instead of hard-coded defaults for data-poor alleles, we place conjugate
+    Beta priors over alpha_h and beta_h:
+        alpha_h ~ Beta(a_alpha, b_alpha)    → E[alpha] = a/(a+b)
+        beta_h  ~ Beta(a_beta, b_beta)      → E[beta]  = a/(a+b)
 
-      beta_h:  fraction of binder labels in near-unanimous non-binder clusters
-               (clusters where >90% of labels are non-binders and n >= 5).
-               Represents contaminant co-purification.
+    The posterior mean given observed data becomes:
+        alpha_h = (a_alpha + FN_h) / (a_alpha + b_alpha + N_binder_h)
+        beta_h  = (a_beta  + FP_h) / (a_beta  + b_beta  + N_nonbinder_h)
 
-    For alleles with too few high-confidence clusters, global defaults are used:
-      alpha_default = 0.10, beta_default = 0.02
-
-    Values are clamped to:
-      alpha_h ∈ [0.001, 0.40]
-      beta_h  ∈ [0.001, 0.15]
+    For well-observed alleles, the data dominates. For data-poor alleles,
+    the posterior reverts to the prior mean — no hard-coded defaults needed.
 
     Returns:
         (alpha_h, beta_h) — each ndarray of shape (n_hla,)
     """
-    print("[L1] Estimating noise parameters...")
+    print("[L1] Estimating noise parameters (Bayesian)...")
     t0 = time.time()
-
-    alpha_h = np.full(n_hla, cfg.alpha_default, dtype=np.float64)
-    beta_h = np.full(n_hla, cfg.beta_default, dtype=np.float64)
 
     n_pos = agg["n_pos"].values
     n_neg = agg["n_neg"].values
@@ -67,43 +60,98 @@ def estimate_noise_params(
     min_n = cfg.noise_min_cluster_size
     purity = cfg.noise_purity_threshold
 
-    # ── estimate alpha_h (false negative rate) ──
-    # from clusters where almost all labels are binders
+    # Beta prior hyperparameters
+    a_a, b_a = cfg.alpha_prior_a, cfg.alpha_prior_b  # for alpha (FN rate)
+    a_b, b_b = cfg.beta_prior_a, cfg.beta_prior_b    # for beta  (FP rate)
+
+    # ── alpha_h: false negative rate ──
+    # Estimated from near-unanimous binder clusters (>90% binder, n>=5).
+    # FN_h = non-binder labels in these clusters (false negatives).
+    # N_binder_h = total labels in these clusters.
+    fn_num = np.zeros(n_hla, dtype=np.float64)
+    fn_den = np.zeros(n_hla, dtype=np.float64)
     binder_mask = (n_total >= min_n) & (n_pos / n_total > purity)
     if binder_mask.any():
-        # for each allele, sum non-binder labels in binder-dominated clusters
-        fn_num = np.zeros(n_hla, dtype=np.float64)   # false neg count
-        fn_den = np.zeros(n_hla, dtype=np.float64)   # total in those clusters
         idx_b = hla_idx[binder_mask]
         np.add.at(fn_num, idx_b, n_neg[binder_mask])
         np.add.at(fn_den, idx_b, n_total[binder_mask])
-        has_data = fn_den > 0
-        alpha_h[has_data] = fn_num[has_data] / fn_den[has_data]
 
-    # ── estimate beta_h (false positive rate) ──
-    # from clusters where almost all labels are non-binders
+    # Beta posterior mean: (a_alpha + FN) / (a_alpha + b_alpha + N_binder)
+    alpha_h = (a_a + fn_num) / (a_a + b_a + fn_den)
+
+    # ── beta_h: false positive rate ──
+    # Estimated from near-unanimous non-binder clusters.
+    fp_num = np.zeros(n_hla, dtype=np.float64)
+    fp_den = np.zeros(n_hla, dtype=np.float64)
     nonbinder_mask = (n_total >= min_n) & (n_neg / n_total > purity)
     if nonbinder_mask.any():
-        fp_num = np.zeros(n_hla, dtype=np.float64)
-        fp_den = np.zeros(n_hla, dtype=np.float64)
         idx_nb = hla_idx[nonbinder_mask]
         np.add.at(fp_num, idx_nb, n_pos[nonbinder_mask])
         np.add.at(fp_den, idx_nb, n_total[nonbinder_mask])
-        has_data = fp_den > 0
-        beta_h[has_data] = fp_num[has_data] / fp_den[has_data]
 
-    # ── clamp to reasonable ranges ──
+    beta_h = (a_b + fp_num) / (a_b + b_b + fp_den)
+
+    # ── clamp to safe ranges ──
     alpha_h = np.clip(alpha_h, 0.001, 0.40)
     beta_h = np.clip(beta_h, 0.001, 0.15)
 
     # ── report ──
-    n_empirical_a = np.sum(~np.isclose(alpha_h, cfg.alpha_default))
-    n_empirical_b = np.sum(~np.isclose(beta_h, cfg.beta_default))
-    print(f"  alpha: empirical for {n_empirical_a}/{n_hla} alleles, "
-          f"mean={alpha_h.mean():.4f}")
-    print(f"  beta:  empirical for {n_empirical_b}/{n_hla} alleles, "
-          f"mean={beta_h.mean():.4f}")
+    n_data_a = np.sum(fn_den > 0)
+    n_data_b = np.sum(fp_den > 0)
+    print(f"  alpha: data for {n_data_a}/{n_hla} alleles, "
+          f"mean={alpha_h.mean():.4f}, "
+          f"prior mean={a_a/(a_a+b_a):.4f}")
+    print(f"  beta:  data for {n_data_b}/{n_hla} alleles, "
+          f"mean={beta_h.mean():.4f}, "
+          f"prior mean={a_b/(a_b+b_b):.4f}")
     print(f"  ({time.time()-t0:.1f}s)")
+    return alpha_h, beta_h
+
+
+def estimate_noise_from_theta(
+    agg: pd.DataFrame,
+    theta: np.ndarray,
+    n_hla: int,
+    cfg: PipelineConfig,
+) -> tuple:
+    """
+    Re-estimate noise parameters given hard theta assignments (for Gibbs).
+
+    Given current theta_ch ∈ {0,1}:
+      alpha_h = Beta posterior mean from pairs where theta=1 (true binders):
+                (a_alpha + Σ_{θ=1} n_neg) / (a_alpha + b_alpha + Σ_{θ=1} n_total)
+      beta_h  = Beta posterior mean from pairs where theta=0 (true non-binders):
+                (a_beta + Σ_{θ=0} n_pos) / (a_beta + b_beta + Σ_{θ=0} n_total)
+    """
+    n_pos = agg["n_pos"].values.astype(np.float64)
+    n_neg = agg["n_neg"].values.astype(np.float64)
+    n_total = agg["n_total"].values.astype(np.float64)
+    hla_idx = agg["hla_idx"].values
+
+    a_a, b_a = cfg.alpha_prior_a, cfg.alpha_prior_b
+    a_b, b_b = cfg.beta_prior_a, cfg.beta_prior_b
+
+    # ── alpha from theta=1 clusters ──
+    binder_mask = theta == 1
+    fn_num = np.zeros(n_hla, dtype=np.float64)
+    fn_den = np.zeros(n_hla, dtype=np.float64)
+    if binder_mask.any():
+        np.add.at(fn_num, hla_idx[binder_mask], n_neg[binder_mask])
+        np.add.at(fn_den, hla_idx[binder_mask], n_total[binder_mask])
+    alpha_h = (a_a + fn_num) / (a_a + b_a + fn_den)
+
+    # ── beta from theta=0 clusters ──
+    nonbinder_mask = theta == 0
+    fp_num = np.zeros(n_hla, dtype=np.float64)
+    fp_den = np.zeros(n_hla, dtype=np.float64)
+    if nonbinder_mask.any():
+        np.add.at(fp_num, hla_idx[nonbinder_mask], n_pos[nonbinder_mask])
+        np.add.at(fp_den, hla_idx[nonbinder_mask], n_total[nonbinder_mask])
+    beta_h = (a_b + fp_num) / (a_b + b_b + fp_den)
+
+    alpha_h = np.clip(alpha_h, 0.001, 0.40)
+    beta_h = np.clip(beta_h, 0.001, 0.15)
+
     return alpha_h, beta_h
 
 

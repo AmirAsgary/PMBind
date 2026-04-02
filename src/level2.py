@@ -136,6 +136,39 @@ def _fisher_one_pair(a, b, c, d):
     return odds_ratio, p_val
 
 
+def _compute_conservative_or(a_vals, b_vals, c_vals, d_vals):
+    """
+    Solution 3: Uncertainty-aware odds ratios.
+
+    Compute the lower bound of the 95% CI for log(OR) using the
+    Haldane-Anscombe correction (+0.5 to all cells).
+
+    OR_conservative = max(1, exp(log(OR) - 1.96 * SE(log OR)))
+
+    This prevents rare alleles from generating massive propagation
+    weights due to small-sample coincidences.
+
+    Returns:
+        ndarray of conservative OR values (≥ 1.0)
+    """
+    # Haldane-Anscombe correction: add 0.5 to prevent zero cells
+    ac = a_vals + 0.5
+    bc = b_vals + 0.5
+    cc = c_vals + 0.5
+    dc = d_vals + 0.5
+
+    log_or = np.log(ac * dc / (bc * cc))
+    se = np.sqrt(1.0/ac + 1.0/bc + 1.0/cc + 1.0/dc)
+
+    # lower bound of 95% CI
+    lb = log_or - 1.96 * se
+
+    # conservative OR: must be > 1 to contribute as positive weight
+    or_conservative = np.maximum(1.0, np.exp(lb))
+
+    return or_conservative
+
+
 def run_fisher_tests(
     a_mat: np.ndarray,
     b_mat: np.ndarray,
@@ -197,6 +230,13 @@ def run_fisher_tests(
         "OR": ors, "pvalue": pvals,
         "shared": a_vals + b_vals + c_vals + d_vals,
     })
+
+    # Solution 3: conservative OR (lower bound of 95% CI with Haldane correction)
+    result_df["OR_conservative"] = _compute_conservative_or(
+        a_vals.astype(np.float64), b_vals.astype(np.float64),
+        c_vals.astype(np.float64), d_vals.astype(np.float64),
+    )
+
     print(f"  Fisher tests done ({time.time()-t0:.1f}s)")
     return result_df
 
@@ -240,7 +280,12 @@ def build_similarity_matrix(
 ) -> np.ndarray:
     """
     Build symmetric HLA similarity matrix S_{hh'} (Eq. 14).
-    S = log(OR) if significant and OR > 0, else 0.
+
+    When cfg.use_conservative_or is True (Solution 3), uses the lower-bound
+    OR instead of the point estimate. This prevents rare-allele inflation
+    of propagation weights.
+
+    S = log(OR) if significant and OR > 1, else 0.
 
     Returns:
         ndarray of shape (n_hla, n_hla)
@@ -252,7 +297,16 @@ def build_similarity_matrix(
         return S
 
     sig = result_df[result_df["significant"]].copy()
-    or_vals = np.clip(sig["OR"].values, 1e-10, None)
+
+    # choose which OR to use for weights
+    if cfg.use_conservative_or and "OR_conservative" in sig.columns:
+        or_col = "OR_conservative"
+        print("  Using conservative OR (lower-bound 95% CI)")
+    else:
+        or_col = "OR"
+        print("  Using point-estimate OR")
+
+    or_vals = np.clip(sig[or_col].values, 1e-10, None)
     log_or = np.log(or_vals)
 
     h1 = sig["h1"].values
@@ -262,8 +316,9 @@ def build_similarity_matrix(
 
     n_pos = np.sum(log_or > 0)
     n_neg = np.sum(log_or < 0)
+    n_zero = np.sum(np.isclose(log_or, 0))
     print(f"  Non-zero entries: {np.count_nonzero(S):,} "
-          f"(positive: {n_pos}, negative: {n_neg})")
+          f"(positive: {n_pos}, zero/neutral: {n_zero}, negative: {n_neg})")
     return S
 
 
