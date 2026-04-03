@@ -61,6 +61,7 @@ from src.level2 import run_level2
 from src.level3 import run_level3
 from src.diagnostics import run_diagnostics
 from src.gibbs import run_gibbs
+from src.analyze_per_hla import run_per_hla_analysis
 
 
 def parse_args():
@@ -300,6 +301,7 @@ def main():
 
     # ── restore stdout and close log file ──
     sys.stdout = _original_stdout
+    run_per_hla_analysis(cfg.output_dir)
     _log_file.close()
 
 
